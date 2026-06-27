@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // Extend the bash whitelist with tools that are not included in little-coder by default but which are both useful and not dangerous.
-const EXTRA_WHITELIST = "sleep,nohup,curl";
+const EXTRA_WHITELIST = "sleep,nohup,curl,kill,cd";
 
 export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (_event) => {
