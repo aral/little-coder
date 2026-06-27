@@ -27,4 +27,4 @@ EXAMPLE WORKFLOW:
   3. Run: `kitten`
   4. Visit: https://localhost
 
-Use timeout=120 for `kitten update`. Use timeout=30 for `kitten` (server starts immediately).
+Use timeout=120 for `kitten update`. Use `kitten &` for kitten (server will block execution otherwise). Make sure you note its process ID and kill it once you’re done.
