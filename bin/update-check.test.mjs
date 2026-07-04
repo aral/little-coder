@@ -9,6 +9,7 @@ import {
   writeCache,
   compareSemver,
   shouldSkip,
+  promptTimeoutMs,
 } from "./update-check.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -171,6 +172,29 @@ describe("shouldSkip", () => {
 
   it("notice-only still applies with --update on non-TTY", () => {
     expect(shouldSkip(["--update"], noEnv, pipeStdout())).toBe("notice-only");
+  });
+});
+
+describe("promptTimeoutMs (issue #64)", () => {
+  it("defaults to 10s when unset or blank", () => {
+    expect(promptTimeoutMs({})).toBe(10000);
+    expect(promptTimeoutMs({ LITTLE_CODER_UPDATE_PROMPT_TIMEOUT: "  " })).toBe(10000);
+  });
+
+  it("honors a numeric seconds override", () => {
+    expect(promptTimeoutMs({ LITTLE_CODER_UPDATE_PROMPT_TIMEOUT: "30" })).toBe(30000);
+    expect(promptTimeoutMs({ LITTLE_CODER_UPDATE_PROMPT_TIMEOUT: "1.5" })).toBe(1500);
+  });
+
+  it("treats 0 / off / never as wait-forever (no timeout)", () => {
+    expect(promptTimeoutMs({ LITTLE_CODER_UPDATE_PROMPT_TIMEOUT: "0" })).toBe(0);
+    expect(promptTimeoutMs({ LITTLE_CODER_UPDATE_PROMPT_TIMEOUT: "off" })).toBe(0);
+    expect(promptTimeoutMs({ LITTLE_CODER_UPDATE_PROMPT_TIMEOUT: "never" })).toBe(0);
+  });
+
+  it("falls back to the default on garbage / negative input", () => {
+    expect(promptTimeoutMs({ LITTLE_CODER_UPDATE_PROMPT_TIMEOUT: "soon" })).toBe(10000);
+    expect(promptTimeoutMs({ LITTLE_CODER_UPDATE_PROMPT_TIMEOUT: "-5" })).toBe(10000);
   });
 });
 

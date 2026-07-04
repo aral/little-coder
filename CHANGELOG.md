@@ -2,6 +2,19 @@
 
 All notable changes to little-coder are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and little-coder's public interface (CLI, providers, tools, skills) follows semver starting at `v0.0.1` post-rename.
 
+## [v1.9.12] — 2026-07-04
+
+### Fixed
+- **Long autonomous runs now compact *before* they overflow the context window** ([#59](https://github.com/itayinbarr/little-coder/issues/59) by [@charly1r](https://github.com/charly1r)). pi only re-evaluates auto-compaction at a *user-turn boundary* — its check runs after `agent.prompt()` fully returns, i.e. once the model stops requesting tools and goes idle. During one long autonomous run that boundary is never reached: little-coder's small models routinely chain dozens of tool-call turns before yielding, so context climbs unchecked and pi only reacts to the *overflow error* after the fact. charly1r reproduced it precisely — context growing 34k → 40k → … → 64k across many turns with no compaction until the request overflowed a 64k window. A new **`context-watchdog`** extension closes the gap: it reads live usage via pi's `getContextUsage()` at every turn boundary and, once usage crosses **80%** of the window, calls pi's `compact()` mid-run — so a single long run compacts at roughly the same point pi would have if the model had paused. Tunable via `LITTLE_CODER_COMPACT_AT_PERCENT` (percent; e.g. `70` to compact earlier); `≤0`/`≥100` or `LITTLE_CODER_NO_COMPACT_WATCHDOG=1` disable it and defer entirely to pi's end-of-run/overflow paths. It's complementary to pi's own compaction (an in-flight guard prevents double-firing) and independent of the `reserveTokens`/`keepRecentTokens` knobs, which still govern how much is summarized vs. kept verbatim.
+
+### Added
+- **The launcher's update prompt auto-continues instead of blocking, plus an in-app notice and `/update` command** ([#64](https://github.com/itayinbarr/little-coder/issues/64) by [@cndjonno](https://github.com/cndjonno)). When a newer version was published, the launcher's `Update now? [Y/n]` prompt blocked startup indefinitely waiting on input — an unattended terminal never got past it. It now **auto-continues without updating after 10 s** (configurable via `LITTLE_CODER_UPDATE_PROMPT_TIMEOUT=<seconds>`; `0`/`off`/`never` restores the old wait-forever behavior), and the prompt shows the countdown. Two follow-ups from the same request: (2) if you dismiss or time out of the launcher prompt, a one-line "update available" notice now appears **inside the running TUI** so the pending update isn't lost, and (3) a new **`/update`** command installs the latest little-coder (with `--ignore-scripts`, matching the launcher's supply-chain posture from [#50](https://github.com/itayinbarr/little-coder/issues/50)) and cleanly ends the session so you can relaunch into it — no quitting to remember the npm incantation.
+
+### Docs
+- **Guide for running little-coder inside Zed via an ACP bridge** ([#58](https://github.com/itayinbarr/little-coder/issues/58) by [@BMorgan1296](https://github.com/BMorgan1296), with [@charly1r](https://github.com/charly1r)). little-coder still ships no ACP server of its own — `--mode rpc` is pi's internal extension-UI RPC, not the Agent Client Protocol — but the community [`pi-acp`](https://github.com/svkozak/pi-acp) bridge drives it well: point pi-acp's `PI_ACP_PI_COMMAND` at the `little-coder` binary and every bundled extension/skill comes along. New [`docs/zed-acp.md`](docs/zed-acp.md) writes up the full setup (Zed `agent_servers` config + a wrapper script that starts/stops `llama-server`), generalized from BMorgan1296's working recipe. Marked explicitly as community/unofficial — a first-class ACP transport still belongs in pi upstream, where both projects would benefit.
+
+---
+
 ## [v1.9.11] — 2026-06-28
 
 ### Fixed

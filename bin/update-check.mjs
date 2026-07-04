@@ -13,6 +13,22 @@ import { createInterface } from "node:readline";
 const REGISTRY = "https://registry.npmjs.org/little-coder/latest";
 const CACHE_TTL_MS = 12 * 60 * 60 * 1000;   // 12 h
 const FETCH_TIMEOUT_MS = 2000;
+const DEFAULT_PROMPT_TIMEOUT_MS = 10 * 1000; // auto-continue after 10s (issue #64)
+
+// How long to wait for a Y/n answer at the interactive update prompt before
+// auto-continuing WITHOUT updating, so a launch is never blocked indefinitely
+// on an unattended terminal (issue #64). Configurable via
+// LITTLE_CODER_UPDATE_PROMPT_TIMEOUT (seconds); "0" / "off" / "never" waits
+// forever (the pre-#64 behavior). Non-numeric → default.
+export function promptTimeoutMs(env = process.env) {
+  const raw = env.LITTLE_CODER_UPDATE_PROMPT_TIMEOUT;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_PROMPT_TIMEOUT_MS;
+  const v = raw.trim().toLowerCase();
+  if (v === "0" || v === "off" || v === "never") return 0;
+  const secs = Number(v);
+  if (!Number.isFinite(secs) || secs < 0) return DEFAULT_PROMPT_TIMEOUT_MS;
+  return Math.round(secs * 1000);
+}
 
 export function cachePath() {
   const xdg = process.env.XDG_CACHE_HOME && process.env.XDG_CACHE_HOME.trim();
@@ -105,14 +121,25 @@ export function shouldSkip(argv = process.argv.slice(2), env = process.env, stdo
   return false;
 }
 
-function promptYesNo(question) {
+function promptYesNo(question, timeoutMs = 0) {
   return new Promise((resolve) => {
     if (!process.stdin.isTTY) {
       resolve(false);
       return;
     }
     const rl = createInterface({ input: process.stdin, output: process.stderr });
+    let timer;
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        rl.close();
+        process.stderr.write("\n   No response — continuing without updating.\n\n");
+        resolve(false);
+      }, timeoutMs);
+      // Don't let a pending countdown keep the event loop alive on its own.
+      if (typeof timer.unref === "function") timer.unref();
+    }
     rl.question(question, (answer) => {
+      if (timer) clearTimeout(timer);
       rl.close();
       const a = (answer ?? "").trim().toLowerCase();
       resolve(a === "" || a === "y" || a === "yes");
@@ -146,6 +173,12 @@ export async function checkForUpdate(currentVersion, opts = {}) {
     return false;
   }
 
+  // Surface the available version to the running pi process (the update-notice
+  // extension reads this to show an in-UI banner + enable /update) whether or
+  // not the user updates now. Cleared implicitly on a successful update below,
+  // since that path exits and the relaunched, up-to-date binary won't set it.
+  process.env.LITTLE_CODER_UPDATE_AVAILABLE = latest;
+
   const headline =
     `\n📦 little-coder v${latest} is available (you have v${currentVersion}).`;
 
@@ -156,8 +189,10 @@ export async function checkForUpdate(currentVersion, opts = {}) {
     return false;
   }
 
+  const timeoutMs = opts.promptTimeoutMs ?? promptTimeoutMs();
+  const timeoutHint = timeoutMs > 0 ? ` (auto-continues in ${Math.round(timeoutMs / 1000)}s)` : "";
   process.stderr.write(`${headline}\n`);
-  const wantsUpdate = await promptYesNo("   Update now? [Y/n] ");
+  const wantsUpdate = await promptYesNo(`   Update now? [Y/n]${timeoutHint} `, timeoutMs);
   if (!wantsUpdate) {
     process.stderr.write("   Skipping update for this run.\n\n");
     return false;
