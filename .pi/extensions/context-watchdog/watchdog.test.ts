@@ -1,5 +1,10 @@
-import { describe, it, expect } from "vitest";
-import { thresholdPercent, shouldCompactNow, type ContextUsageLike } from "./index.ts";
+import { describe, it, expect, vi } from "vitest";
+import setupWatchdog, {
+  thresholdPercent,
+  shouldCompactNow,
+  RESUME_MESSAGE,
+  type ContextUsageLike,
+} from "./index.ts";
 
 describe("thresholdPercent", () => {
   it("defaults to 80 when unset", () => {
@@ -62,6 +67,74 @@ describe("shouldCompactNow", () => {
     expect(shouldCompactNow(usage({ percent: 99 }), 0, false)).toBe(false);
     expect(shouldCompactNow(undefined, 80, false)).toBe(false);
     expect(shouldCompactNow(usage({ contextWindow: 0 }), 80, false)).toBe(false);
+  });
+
+  it("reproduces #59 followup: after compaction, the run is resumed (not stranded at the prompt)", async () => {
+    // Wire up the real extension against a mock pi/ctx and drive one turn_start
+    // over the threshold. The key regression: pi's threshold compaction aborts
+    // the run and does NOT auto-continue, so without a resume the task stalls.
+    const env = process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+    process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "80";
+    try {
+      const handlers: Record<string, Function> = {};
+      const sendUserMessage = vi.fn();
+      const pi = {
+        on: (evt: string, h: Function) => { handlers[evt] = h; },
+        sendUserMessage,
+      };
+      setupWatchdog(pi as any);
+
+      let capturedOpts: any;
+      const ctx = {
+        getContextUsage: () => ({ tokens: 52000, contextWindow: 64000, percent: 81 }),
+        ui: { notify: vi.fn() },
+        compact: (opts: any) => { capturedOpts = opts; },
+      };
+
+      await handlers.turn_start({}, ctx);
+      // Compaction was requested with completion callbacks…
+      expect(capturedOpts).toBeTruthy();
+      expect(typeof capturedOpts.onComplete).toBe("function");
+      // …and nothing is sent until compaction actually finishes.
+      expect(sendUserMessage).not.toHaveBeenCalled();
+
+      // Simulate pi finishing the compaction (agent reconnected + idle).
+      capturedOpts.onComplete();
+      expect(sendUserMessage).toHaveBeenCalledTimes(1);
+      expect(sendUserMessage).toHaveBeenCalledWith(RESUME_MESSAGE);
+    } finally {
+      if (env === undefined) delete process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+      else process.env.LITTLE_CODER_COMPACT_AT_PERCENT = env;
+    }
+  });
+
+  it("does not re-fire while a compaction is mid-flight, then re-arms after it completes", async () => {
+    const env = process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+    process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "80";
+    try {
+      const handlers: Record<string, Function> = {};
+      const sendUserMessage = vi.fn();
+      const pi = { on: (e: string, h: Function) => { handlers[e] = h; }, sendUserMessage };
+      setupWatchdog(pi as any);
+
+      const compact = vi.fn();
+      const ctx = {
+        getContextUsage: () => ({ tokens: 52000, contextWindow: 64000, percent: 81 }),
+        ui: { notify: vi.fn() },
+        compact,
+      };
+
+      await handlers.turn_start({}, ctx);       // fires
+      await handlers.turn_start({}, ctx);       // guarded — still mid-flight
+      expect(compact).toHaveBeenCalledTimes(1);
+
+      compact.mock.calls[0][0].onComplete();    // compaction done, re-armed
+      await handlers.turn_start({}, ctx);       // fires again
+      expect(compact).toHaveBeenCalledTimes(2);
+    } finally {
+      if (env === undefined) delete process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+      else process.env.LITTLE_CODER_COMPACT_AT_PERCENT = env;
+    }
   });
 
   it("reproduces #59: a run climbing 34k→64k on a 64k window compacts before overflow", () => {

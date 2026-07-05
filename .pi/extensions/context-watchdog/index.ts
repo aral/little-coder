@@ -66,17 +66,30 @@ export function shouldCompactNow(
   return usage.percent >= pct;
 }
 
+// The instruction sent to the model to pick the task back up after a mid-run
+// compaction. pi's threshold compaction is deliberately "compact, then let the
+// user continue manually" — so an autonomous run left mid-task would otherwise
+// just sit at the prompt (charly1r's v1.9.12 follow-up on #59). This user
+// message resumes it automatically; the compaction summary immediately above it
+// preserves what was already done.
+export const RESUME_MESSAGE =
+  "Your context was automatically compacted mid-task to stay within the model's window. " +
+  "Continue the task from where you left off — the summary above preserves the work done so far. " +
+  "Do not restart from scratch or re-ask the user; just carry on.";
+
 export default function (pi: ExtensionAPI) {
   const pct = thresholdPercent();
   if (pct <= 0) return; // disabled — register nothing
 
-  // In flight until the matching `session_compact` (or the next user prompt)
-  // clears it, so a burst of turn_start events can't stack compaction calls.
+  // In flight from the turn_start that fires compaction until compaction
+  // resolves (onComplete/onError), so a burst of turn_start events can't stack
+  // multiple compaction calls on top of each other.
   let compacting = false;
 
   pi.on("before_agent_start", async () => {
-    // A fresh user prompt is a clean boundary; drop any stale in-flight flag so
-    // a cancelled/failed compaction can't wedge the watchdog off permanently.
+    // Each fresh user turn (including the auto-resume below) is a clean boundary;
+    // drop any stale flag so a cancelled/failed compaction can't wedge the
+    // watchdog off permanently.
     compacting = false;
   });
 
@@ -89,12 +102,21 @@ export default function (pi: ExtensionAPI) {
       `context at ${Math.round(usage!.percent!)}% of ${windowK}k — compacting mid-run to stay under the window`,
       "info",
     );
-    // Fire-and-forget: pi runs compaction and the run continues on the compacted
-    // transcript. We do NOT await (the API is explicitly non-awaiting).
-    ctx.compact();
-  });
-
-  pi.on("session_compact", async () => {
-    compacting = false;
+    // pi's public compact() is the *manual* path: it aborts the in-flight run,
+    // summarizes, then reconnects the agent and leaves it idle (no auto-retry).
+    // On its own that strands an autonomous task at the prompt — so we resume it
+    // from onComplete once the agent is back and idle. sendUserMessage always
+    // triggers a turn, driving the run forward on the freshly-compacted context.
+    ctx.compact({
+      onComplete: () => {
+        pi.sendUserMessage(RESUME_MESSAGE);
+        compacting = false;
+      },
+      // "Nothing to compact" / cancelled etc.: clear the flag so a later turn
+      // can try again rather than the watchdog going silent for the session.
+      onError: () => {
+        compacting = false;
+      },
+    });
   });
 }

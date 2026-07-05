@@ -2,6 +2,13 @@
 
 All notable changes to little-coder are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and little-coder's public interface (CLI, providers, tools, skills) follows semver starting at `v0.0.1` post-rename.
 
+## [v1.9.13] — 2026-07-05
+
+### Fixed
+- **The mid-run compaction watchdog now *resumes* the task instead of stranding it at the prompt** ([#59](https://github.com/itayinbarr/little-coder/issues/59) follow-up by [@charly1r](https://github.com/charly1r)). v1.9.12's `context-watchdog` correctly fired compaction at 80% mid-run — charly1r confirmed the trigger works across models — but afterward the run just sat idle until he typed something, with llama.cpp still showing activity. Root cause: pi's public `compact()` is the *manual* path (`_disconnectFromAgent` → `abort` → summarize → reconnect, then idle), and pi's threshold compaction is deliberately "compact, **no** auto-retry — the user continues manually." So the watchdog aborted the autonomous run to compact and never told it to carry on. The fix passes an `onComplete` callback to `compact()` and, once the agent is reconnected and idle, calls `pi.sendUserMessage(...)` (which always triggers a turn) with a short instruction to continue the task from where it left off on the freshly-compacted context — so a long run now compacts *and* keeps going, untouched. The in-flight guard still prevents stacked compactions and re-arms on completion. Behaviour is unchanged when the watchdog is disabled (`LITTLE_CODER_NO_COMPACT_WATCHDOG=1` / `LITTLE_CODER_COMPACT_AT_PERCENT` out of band).
+
+---
+
 ## [v1.9.12] — 2026-07-04
 
 ### Fixed
