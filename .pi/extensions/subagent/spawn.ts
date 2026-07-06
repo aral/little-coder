@@ -185,10 +185,58 @@ export interface RunSubCoderOptions {
   signal?: AbortSignal;
   /** Called whenever the child emits a new message, with the live result. */
   onUpdate?: (r: SubCoderResult) => void;
+  /**
+   * Text appended to the task. Defaults to REPORT_SUFFIX (ask for a concise,
+   * citation-bearing research report) — right for research children. Pass "" for
+   * REASONING steps (e.g. "output ONLY JSON" / "write a brief"), where the report
+   * framing derails the model into answering the topic instead of the instruction.
+   */
+  reportSuffix?: string;
+  /**
+   * Override the child's allowed tools (default SUBCODER_ALLOWED_TOOLS). Use a
+   * narrower set to, e.g., deny `bash` to research children so they can't
+   * scaffold/compile in the working tree, or restrict reasoning steps to
+   * read-only local tools. A comma-separated tool-name string.
+   */
+  allowedTools?: string;
+  /**
+   * Watchdog: kill the child and mark it failed if it runs longer than this many
+   * ms. Guards against a hung agent (e.g. a browser stuck on a page) blocking the
+   * whole run indefinitely. Omit for no timeout.
+   */
+  timeoutMs?: number;
+  /**
+   * If the child is killed by the watchdog (only), run it ONCE more with a fresh
+   * timeout window before giving up. A hang is often transient (a single browser
+   * page wedged, a slow source) and a clean retry recovers the finding — otherwise
+   * that subtopic is silently missing from the report. Only timeouts are retried;
+   * a deterministic failure (bad launcher, non-zero exit) is returned as-is.
+   */
+  retryOnTimeout?: boolean;
+}
+
+// Did the watchdog (not a normal exit) kill this child?
+function wasTimeout(r: SubCoderResult): boolean {
+  return r.exitCode !== 0 && /timed out/i.test(r.errorMessage ?? "");
+}
+
+/**
+ * Run one sub-coder, retrying once if the watchdog killed it and retryOnTimeout is
+ * set. Never throws — failures land in exitCode/stderr.
+ */
+export async function runSubCoder(opts: RunSubCoderOptions): Promise<SubCoderResult> {
+  const first = await runSubCoderOnce(opts);
+  if (!opts.retryOnTimeout || !wasTimeout(first) || opts.signal?.aborted) return first;
+  const second = await runSubCoderOnce(opts);
+  // Record that a retry happened (visible in tool details, never sent to the parent).
+  second.stderr =
+    `[retry] first attempt ${first.errorMessage}; retried once` +
+    `${second.exitCode === 0 ? " — succeeded" : ""}\n${second.stderr}`;
+  return second;
 }
 
 /** Run one sub-coder to completion. Never throws — failures land in exitCode/stderr. */
-export async function runSubCoder(opts: RunSubCoderOptions): Promise<SubCoderResult> {
+async function runSubCoderOnce(opts: RunSubCoderOptions): Promise<SubCoderResult> {
   const result: SubCoderResult = {
     id: opts.id,
     label: opts.label,
@@ -219,7 +267,7 @@ export async function runSubCoder(opts: RunSubCoderOptions): Promise<SubCoderRes
     // Match the parent's model so children run on the same backend. Without
     // this the child would fall back to pi's default model.
     ...(opts.model ? ["--model", opts.model] : []),
-    opts.task + REPORT_SUFFIX,
+    opts.task + (opts.reportSuffix ?? REPORT_SUFFIX),
   ];
 
   const emit = () => {
@@ -234,7 +282,7 @@ export async function runSubCoder(opts: RunSubCoderOptions): Promise<SubCoderRes
         cwd: opts.cwd,
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
-        env: buildChildEnv(),
+        env: buildChildEnv(opts.allowedTools ? { LITTLE_CODER_ALLOWED_TOOLS: opts.allowedTools } : undefined),
       });
     } catch (e) {
       result.stderr += String((e as Error)?.message ?? e);
@@ -282,30 +330,45 @@ export async function runSubCoder(opts: RunSubCoderOptions): Promise<SubCoderRes
     proc.stderr.on("data", (d) => {
       result.stderr += d.toString();
     });
+    // SIGTERM then SIGKILL — shared by the abort-signal and the watchdog timeout.
+    const kill = () => {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        /* already gone */
+      }
+      setTimeout(() => {
+        try {
+          if (!proc.killed) proc.kill("SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }, 4000);
+    };
+
+    // Watchdog: a child that hangs (e.g. a browser stuck on a page) must not
+    // block the run forever. On timeout, mark it failed and kill it.
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    if (opts.timeoutMs && opts.timeoutMs > 0) {
+      watchdog = setTimeout(() => {
+        result.errorMessage = `timed out after ${Math.round(opts.timeoutMs! / 1000)}s`;
+        result.stderr += `\n[watchdog] ${result.errorMessage}`;
+        kill();
+      }, opts.timeoutMs);
+    }
+
     proc.on("close", (code) => {
+      if (watchdog) clearTimeout(watchdog);
       if (buffer.trim()) processLine(buffer);
       resolveP(code ?? 0);
     });
     proc.on("error", (e) => {
+      if (watchdog) clearTimeout(watchdog);
       result.stderr += String(e?.message ?? e);
       resolveP(1);
     });
 
     if (opts.signal) {
-      const kill = () => {
-        try {
-          proc.kill("SIGTERM");
-        } catch {
-          /* already gone */
-        }
-        setTimeout(() => {
-          try {
-            if (!proc.killed) proc.kill("SIGKILL");
-          } catch {
-            /* ignore */
-          }
-        }, 4000);
-      };
       if (opts.signal.aborted) kill();
       else opts.signal.addEventListener("abort", kill, { once: true });
     }
@@ -357,6 +420,10 @@ export async function runSubCodersConcurrent(
     signal?: AbortSignal;
     concurrency?: number;
     model?: string;
+    allowedTools?: string;
+    timeoutMs?: number;
+    retryOnTimeout?: boolean;
+    reportSuffix?: string;
     onUpdate?: (all: SubCoderResult[]) => void;
   } = {},
 ): Promise<SubCoderResult[]> {
@@ -381,6 +448,10 @@ export async function runSubCodersConcurrent(
       cwd: it.cwd,
       model: opts.model,
       signal: opts.signal,
+      allowedTools: opts.allowedTools,
+      timeoutMs: opts.timeoutMs,
+      retryOnTimeout: opts.retryOnTimeout,
+      reportSuffix: opts.reportSuffix,
       onUpdate: (live) => {
         all[i] = live;
         snapshot();

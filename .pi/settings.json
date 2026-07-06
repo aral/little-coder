@@ -3,6 +3,9 @@
   "compaction": { "enabled": true },
   "retry": { "enabled": true, "maxRetries": 2 },
   "little_coder": {
+    "deep_research": {
+      "default_max_subagents": 10
+    },
     "default_model_profile": {
       "max_tokens": 4096,
       "thinking_budget": 4096,
