@@ -175,6 +175,25 @@ Merge semantics: each top-level provider key in your override file **fully repla
 
 **Default model.** A top-level `"default": "provider/id"` key names the model bare `little-coder` launches when you don't pass `--model` and pi has no saved selection yet (shipped default: `llamacpp/qwen3.6-35b-a3b`). Your override file's `default` wins over the shipped one, so `{"default": "llamacpp/qwen3.6-27b"}` in `~/.config/little-coder/models.json` makes the dense 27B your first-run default. It's first-run-only: once you switch models in-session, pi remembers that and the default stops applying.
 
+**Community-recommended models.** The shipped `models.json` stays intentionally small and stable — it doesn't track the fast-moving world of community fine-tunes (which get re-uploaded and disappear from Hugging Face constantly). If you want to try one that's doing well in the community — e.g. `Qwen3.6-35B-A3B-REAM-192`, which topped both a community tournament and a little-coder pilot ([#63](https://github.com/itayinbarr/little-coder/issues/63)) — add it to your **own** override file rather than waiting for it to ship. Load the GGUF on your llama.cpp server, then drop an entry in `~/.config/little-coder/models.json`:
+
+```json
+{
+  "providers": {
+    "llamacpp": {
+      "api": "openai-completions",
+      "baseUrl": "http://127.0.0.1:8888/v1",
+      "apiKey": "LLAMACPP_API_KEY",
+      "models": [
+        { "id": "ream-192", "name": "Qwen3.6-35B-A3B REAM-192 (community)", "reasoning": true, "input": ["text"] }
+      ]
+    }
+  }
+}
+```
+
+Then pick it with `little-coder --model llamacpp/ream-192`. (llama.cpp serves whichever GGUF you loaded regardless of the id, so the `id` is just your handle for it.)
+
 Example — switch the llama.cpp port and bump `qwen3.6-35b-a3b` to a 150K context, leave ollama untouched:
 
 ```json
