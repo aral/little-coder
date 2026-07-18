@@ -18,6 +18,41 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkForUpdate } from "./update-check.mjs";
 import { parseExtraExtensions } from "./extras.mjs";
+import { resolveConfiguredDefault, decideDefaultModel } from "./default-model.mjs";
+
+// Resolve pi's agent directory (where it persists settings.json / keybindings).
+// Honors PI_CODING_AGENT_DIR (with ~ expansion), else ~/.pi/agent. Shared by the
+// default-model detection (issue #65) and the global-settings merge below.
+function resolveAgentDir() {
+  const agentDirEnv = process.env.PI_CODING_AGENT_DIR;
+  if (agentDirEnv && agentDirEnv.trim().length > 0) {
+    if (agentDirEnv === "~") return homedir();
+    if (agentDirEnv.startsWith("~/")) return homedir() + agentDirEnv.slice(1);
+    return agentDirEnv;
+  }
+  return join(homedir(), ".pi", "agent");
+}
+
+// Best-effort JSON read: returns the parsed object or undefined on any failure.
+function readJsonSafe(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    return undefined;
+  }
+}
+
+// User models.json override path, mirroring llama-cpp-provider/config.ts's
+// resolution order (LITTLE_CODER_MODELS_FILE → XDG → ~/.config).
+function resolveUserModelsPath() {
+  if (process.env.LITTLE_CODER_MODELS_FILE) return process.env.LITTLE_CODER_MODELS_FILE;
+  if (process.env.XDG_CONFIG_HOME) {
+    return join(process.env.XDG_CONFIG_HOME, "little-coder", "models.json");
+  }
+  const home = process.env.HOME || process.env.USERPROFILE;
+  if (home) return join(home, ".config", "little-coder", "models.json");
+  return undefined;
+}
 
 // ---- 1. Node version preflight (>= 22.19.0, matching pi.dev) ----
 const MIN_NODE = [22, 19, 0];
@@ -152,8 +187,47 @@ if (!isSubagent) {
   const forceUpdate = process.argv.includes("--update");
   const exitAfterCheck = await checkForUpdate(currentVersion, { force: forceUpdate });
   if (exitAfterCheck) {
-    // Successful update happened; user needs to re-run the new binary.
-    process.exit(0);
+    // A successful update just replaced the on-disk launcher with the new
+    // version. Instead of exiting and making the user re-type `little-coder`
+    // (issue #66), re-exec THIS same launcher path under the current Node — the
+    // file on disk is now the updated one, so it loads the new code — passing
+    // the user's original args through so they land straight in the new
+    // version. We add --no-update-check so the child doesn't re-poll the
+    // registry (it's already the latest), which also rules out any relaunch
+    // loop. Best-effort: if the re-exec can't start, we fall back to exiting
+    // with the manual-relaunch hint that checkForUpdate already printed.
+    const passthrough = process.argv
+      .slice(2)
+      .filter((a) => a !== "--update" && a !== "--no-update-check");
+    process.stderr.write("   Relaunching little-coder…\n\n");
+    try {
+      const relaunch = spawn(
+        process.execPath,
+        [process.argv[1], "--no-update-check", ...passthrough],
+        { stdio: "inherit", cwd: process.cwd(), env: process.env },
+      );
+      relaunch.on("exit", (code, signal) => {
+        if (signal) process.kill(process.pid, signal);
+        else process.exit(code ?? 0);
+      });
+      relaunch.on("error", (err) => {
+        process.stderr.write(
+          `   Could not relaunch automatically (${err.message}). ` +
+            "Run `little-coder` to start the new version.\n",
+        );
+        process.exit(0);
+      });
+    } catch (err) {
+      process.stderr.write(
+        `   Could not relaunch automatically (${err?.message ?? err}). ` +
+          "Run `little-coder` to start the new version.\n",
+      );
+      process.exit(0);
+    }
+    // Do not fall through to spawning pi from the just-replaced (old) process;
+    // the relaunched child owns the session now.
+  } else {
+    // no update — continue into the normal launch path below
   }
 }
 
@@ -178,11 +252,43 @@ const userPickedThinking =
 const headless = isSubagent || userArgs.includes("--mode") || userArgs.includes("-p");
 const thinkingArgs = !userPickedThinking && !headless ? ["--thinking", "medium"] : [];
 
+// ---- 6b. Default model on bare launch (issue #65) ----
+// If models.json declares a top-level "default": "provider/id" and the user
+// neither passed their own --model nor already has a pi-persisted model
+// selection, inject that default so `little-coder` with no args just works, and
+// print the model's friendly name. First-run-only: once the user picks a model
+// in-session (pi persists defaultProvider/defaultModel), we never override it.
+// Skipped for headless/sub-coder runs, which set their own model. Best-effort:
+// any read/parse failure just leaves pi's own selection behavior unchanged.
+const defaultModelArgs = [];
+try {
+  const configuredDefault = resolveConfiguredDefault(
+    readJsonSafe(join(pkgRoot, "models.json")),
+    (() => {
+      const p = resolveUserModelsPath();
+      return p ? readJsonSafe(p) : undefined;
+    })(),
+  );
+  const decision = decideDefaultModel({
+    configuredDefault,
+    argv: userArgs,
+    piSettings: readJsonSafe(join(resolveAgentDir(), "settings.json")),
+    headless,
+  });
+  if (decision) {
+    defaultModelArgs.push("--model", decision.ref);
+    process.stderr.write(`   ▸ default model: ${decision.name}  (${decision.ref})\n`);
+  }
+} catch {
+  // never block launch over default-model resolution
+}
+
 const piArgs = [
   "--no-context-files",
   "--no-extensions",
   ...(existsSync(agentsMd) ? ["--system-prompt", agentsMd] : []),
   ...thinkingArgs,
+  ...defaultModelArgs,
   ...extArgs,
   ...userArgs,
 ];
@@ -226,17 +332,7 @@ if (process.env.PI_SKIP_VERSION_CHECK === undefined) {
 // Skipped for headless sub-coders: they share the user's settings (already
 // written by the interactive parent) and shouldn't each re-do the merge.
 if (!isSubagent) try {
-  const agentDirEnv = process.env.PI_CODING_AGENT_DIR;
-  let agentDir;
-  if (agentDirEnv && agentDirEnv.trim().length > 0) {
-    agentDir = agentDirEnv === "~"
-      ? homedir()
-      : agentDirEnv.startsWith("~/")
-        ? homedir() + agentDirEnv.slice(1)
-        : agentDirEnv;
-  } else {
-    agentDir = join(homedir(), ".pi", "agent");
-  }
+  const agentDir = resolveAgentDir();
   mkdirSync(agentDir, { recursive: true });
   const globalSettingsPath = join(agentDir, "settings.json");
   let globalSettings = {};

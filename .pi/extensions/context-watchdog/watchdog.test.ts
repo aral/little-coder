@@ -2,6 +2,8 @@ import { describe, it, expect, vi } from "vitest";
 import setupWatchdog, {
   thresholdPercent,
   shouldCompactNow,
+  compactionHelped,
+  MIN_PROGRESS_PCT,
   RESUME_MESSAGE,
   type ContextUsageLike,
 } from "./index.ts";
@@ -108,7 +110,7 @@ describe("shouldCompactNow", () => {
     }
   });
 
-  it("does not re-fire while a compaction is mid-flight, then re-arms after it completes", async () => {
+  it("does not re-fire while a compaction is mid-flight, then re-arms after a compaction that freed headroom", async () => {
     const env = process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
     process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "80";
     try {
@@ -117,9 +119,12 @@ describe("shouldCompactNow", () => {
       const pi = { on: (e: string, h: Function) => { handlers[e] = h; }, sendUserMessage };
       setupWatchdog(pi as any);
 
+      // Mutable usage so we can model a compaction that actually frees space:
+      // 81% → compact → 40% (helped) → climbs back to 81% → fires again.
+      let percent = 81;
       const compact = vi.fn();
       const ctx = {
-        getContextUsage: () => ({ tokens: 52000, contextWindow: 64000, percent: 81 }),
+        getContextUsage: () => ({ tokens: 52000, contextWindow: 64000, percent }),
         ui: { notify: vi.fn() },
         compact,
       };
@@ -128,13 +133,113 @@ describe("shouldCompactNow", () => {
       await handlers.turn_start({}, ctx);       // guarded — still mid-flight
       expect(compact).toHaveBeenCalledTimes(1);
 
-      compact.mock.calls[0][0].onComplete();    // compaction done, re-armed
+      percent = 40;                             // compaction opened real headroom
+      compact.mock.calls[0][0].onComplete();    // done, re-armed
+      await handlers.turn_start({}, ctx);       // measures 40% (helped) — no fire
+      expect(compact).toHaveBeenCalledTimes(1);
+
+      percent = 81;                             // context climbed again
       await handlers.turn_start({}, ctx);       // fires again
       expect(compact).toHaveBeenCalledTimes(2);
     } finally {
       if (env === undefined) delete process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
       else process.env.LITTLE_CODER_COMPACT_AT_PERCENT = env;
     }
+  });
+
+  it("#68: pauses instead of looping when a compaction frees too little, then re-arms on recovery", async () => {
+    const env = process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+    process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "80";
+    try {
+      const handlers: Record<string, Function> = {};
+      const sendUserMessage = vi.fn();
+      const pi = { on: (e: string, h: Function) => { handlers[e] = h; }, sendUserMessage };
+      setupWatchdog(pi as any);
+
+      // The #68 shape: after compaction the resumed run re-reads files and usage
+      // is STILL over threshold. A blind watchdog would fire compact() again into
+      // "Nothing to compact"; the guard must pause instead.
+      let percent = 92;
+      const compact = vi.fn();
+      const notify = vi.fn();
+      const ctx = {
+        getContextUsage: () => ({ tokens: 59000, contextWindow: 64000, percent }),
+        ui: { notify },
+        compact,
+      };
+
+      await handlers.turn_start({}, ctx);       // fires the first compaction
+      expect(compact).toHaveBeenCalledTimes(1);
+
+      percent = 90;                             // freed almost nothing (still >> threshold)
+      compact.mock.calls[0][0].onComplete();
+      await handlers.turn_start({}, ctx);       // measures 90% → pause, NO second fire
+      expect(compact).toHaveBeenCalledTimes(1);
+      expect(notify).toHaveBeenCalledWith(
+        expect.stringContaining("paused to avoid a loop"),
+        "warning",
+      );
+
+      // Stays paused while still over the band, even as turns keep coming.
+      await handlers.turn_start({}, ctx);
+      await handlers.turn_start({}, ctx);
+      expect(compact).toHaveBeenCalledTimes(1);
+
+      // Manual recovery (/clear) drops usage below the band → re-arms and fires.
+      percent = 40;
+      await handlers.turn_start({}, ctx);       // re-arm turn (below band)
+      percent = 85;                             // climbs back over threshold
+      await handlers.turn_start({}, ctx);       // fires again
+      expect(compact).toHaveBeenCalledTimes(2);
+    } finally {
+      if (env === undefined) delete process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+      else process.env.LITTLE_CODER_COMPACT_AT_PERCENT = env;
+    }
+  });
+
+  it("#68: a failed compaction (onError) pauses rather than silently retrying", async () => {
+    const env = process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+    process.env.LITTLE_CODER_COMPACT_AT_PERCENT = "80";
+    try {
+      const handlers: Record<string, Function> = {};
+      const pi = { on: (e: string, h: Function) => { handlers[e] = h; }, sendUserMessage: vi.fn() };
+      setupWatchdog(pi as any);
+
+      const compact = vi.fn();
+      const notify = vi.fn();
+      const ctx = {
+        getContextUsage: () => ({ tokens: 59000, contextWindow: 64000, percent: 92 }),
+        ui: { notify },
+        compact,
+      };
+
+      await handlers.turn_start({}, ctx);
+      expect(compact).toHaveBeenCalledTimes(1);
+
+      // pi throws "Nothing to compact" — the guard must pause, not retry.
+      compact.mock.calls[0][0].onError(new Error("Nothing to compact"));
+      expect(notify).toHaveBeenCalledWith(
+        expect.stringContaining("Nothing to compact"),
+        "warning",
+      );
+
+      await handlers.turn_start({}, ctx);
+      await handlers.turn_start({}, ctx);
+      expect(compact).toHaveBeenCalledTimes(1); // still paused, never re-fired
+    } finally {
+      if (env === undefined) delete process.env.LITTLE_CODER_COMPACT_AT_PERCENT;
+      else process.env.LITTLE_CODER_COMPACT_AT_PERCENT = env;
+    }
+  });
+
+  describe("compactionHelped", () => {
+    it("helped only when usage drops at least MIN_PROGRESS below the threshold", () => {
+      expect(compactionHelped(80, 80)).toBe(false);            // still at threshold
+      expect(compactionHelped(90, 80)).toBe(false);            // still over
+      expect(compactionHelped(80 - MIN_PROGRESS_PCT + 1, 80)).toBe(false); // barely under
+      expect(compactionHelped(80 - MIN_PROGRESS_PCT, 80)).toBe(true);      // at the band edge
+      expect(compactionHelped(40, 80)).toBe(true);             // comfortable headroom
+    });
   });
 
   it("reproduces #59: a run climbing 34k→64k on a 64k window compacts before overflow", () => {

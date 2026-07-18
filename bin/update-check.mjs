@@ -219,9 +219,11 @@ export async function checkForUpdate(currentVersion, opts = {}) {
     ? spawnSync(process.env.COMSPEC || "cmd.exe", ["/c", "npm", ...npmArgs], { stdio: "inherit" })
     : spawnSync("npm", npmArgs, { stdio: "inherit" });
   if (result.status === 0) {
-    process.stderr.write(
-      `\n   ✓ Updated to v${latest}. Re-run \`little-coder\` to use the new version.\n\n`,
-    );
+    // The launcher re-execs into the freshly-installed version from here
+    // (issue #66), so we don't tell the user to re-run by hand — it prints
+    // "Relaunching little-coder…" next. If that re-exec can't start, the
+    // launcher falls back to a manual-relaunch hint.
+    process.stderr.write(`\n   ✓ Updated to v${latest}.\n`);
     return true;
   }
   const exitDesc = result.error
