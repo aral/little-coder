@@ -115,7 +115,7 @@ Built something? Open an issue or PR and it goes on this list. These are **commu
 | What | By | Where |
 |---|---|---|
 | **Zed / ACP bridge** — run little-coder as an external agent inside Zed via `pi-acp`, with a wrapper that starts and stops `llama-server` alongside it | [@BMorgan1296](https://github.com/BMorgan1296), with [@charly1r](https://github.com/charly1r) | [`docs/zed-acp.md`](zed-acp.md), [svkozak/pi-acp](https://github.com/svkozak/pi-acp), [#58](https://github.com/itayinbarr/little-coder/issues/58) |
-| **Telegram bridge** — drive little-coder from Telegram, using the repo's own `benchmarks/rpc_client.py` so you get the same extensions, `AGENTS.md`, and speed as the terminal | [@johnzan](https://github.com/johnzan) | [#69](https://github.com/itayinbarr/little-coder/issues/69) |
+| **Telegram bridge** — drive little-coder from Telegram, using the repo's own `benchmarks/rpc_client.py` so you get the same extensions, `AGENTS.md`, and speed as the terminal (needs a local `git clone` + `npm install`, since `rpc_client.py` points at `node_modules/.bin/pi`) | [@johnzan](https://github.com/johnzan) | [johnzan/little-coder-telegram-bridge](https://github.com/johnzan/little-coder-telegram-bridge), [#69](https://github.com/itayinbarr/little-coder/issues/69) |
 | **llama.cpp configs + local model recommendations** — an ongoing thread of tested configs and blind-tournament model results on consumer hardware | [@charly1r](https://github.com/charly1r) | [#63](https://github.com/itayinbarr/little-coder/issues/63) |
 
 AI-assisted contributions are welcome — that's rather the point of the project. What matters is that it works and that you can explain what it does.
